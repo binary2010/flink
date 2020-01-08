@@ -21,8 +21,10 @@ import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.core.memory.MemorySegmentFactory;
 import org.apache.flink.table.runtime.util.SegmentsUtil;
 import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
+import org.apache.flink.table.types.logical.TimestampType;
 
 import java.nio.ByteOrder;
 
@@ -80,14 +82,16 @@ public final class BinaryRow extends BinarySection implements BaseRow {
 			case TIME_WITHOUT_TIME_ZONE:
 			case INTERVAL_YEAR_MONTH:
 			case BIGINT:
-			case TIMESTAMP_WITHOUT_TIME_ZONE:
-			case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
 			case INTERVAL_DAY_TIME:
 			case FLOAT:
 			case DOUBLE:
 				return true;
 			case DECIMAL:
 				return ((DecimalType) type).getPrecision() <= Decimal.MAX_COMPACT_PRECISION;
+			case TIMESTAMP_WITHOUT_TIME_ZONE:
+				return SqlTimestamp.isCompact(((TimestampType) type).getPrecision());
+			case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+				return SqlTimestamp.isCompact(((LocalZonedTimestampType) type).getPrecision());
 			default:
 				return false;
 		}
@@ -213,6 +217,32 @@ public final class BinaryRow extends BinarySection implements BaseRow {
 	}
 
 	@Override
+	public void setTimestamp(int pos, SqlTimestamp value, int precision) {
+		assertIndexIsValid(pos);
+
+		if (SqlTimestamp.isCompact(precision)) {
+			setLong(pos, value.getMillisecond());
+		} else {
+			int fieldOffset = getFieldOffset(pos);
+			int cursor = (int) (segments[0].getLong(fieldOffset) >>> 32);
+			assert cursor > 0 : "invalid cursor " + cursor;
+
+			if (value == null) {
+				setNullAt(pos);
+				// zero-out the bytes
+				SegmentsUtil.setLong(segments, offset + cursor, 0L);
+				// keep the offset for future update
+				segments[0].putLong(fieldOffset, ((long) cursor) << 32);
+			} else {
+				// write millisecond to the variable length portion.
+				SegmentsUtil.setLong(segments, offset + cursor, value.getMillisecond());
+				// write nanoOfMillisecond to the fixed-length portion.
+				setLong(pos, ((long) cursor << 32) | (long) value.getNanoOfMillisecond());
+			}
+		}
+	}
+
+	@Override
 	public void setBoolean(int pos, boolean value) {
 		assertIndexIsValid(pos);
 		setNotNullAt(pos);
@@ -302,6 +332,19 @@ public final class BinaryRow extends BinarySection implements BaseRow {
 		int fieldOffset = getFieldOffset(pos);
 		final long offsetAndSize = segments[0].getLong(fieldOffset);
 		return Decimal.readDecimalFieldFromSegments(segments, offset, offsetAndSize, precision, scale);
+	}
+
+	@Override
+	public SqlTimestamp getTimestamp(int pos, int precision) {
+		assertIndexIsValid(pos);
+
+		if (SqlTimestamp.isCompact(precision)) {
+			return SqlTimestamp.fromEpochMillis(segments[0].getLong(getFieldOffset(pos)));
+		}
+
+		int fieldOffset = getFieldOffset(pos);
+		final long offsetAndNanoOfMilli = segments[0].getLong(fieldOffset);
+		return SqlTimestamp.readTimestampFieldFromSegments(segments, offset, offsetAndNanoOfMilli);
 	}
 
 	@Override

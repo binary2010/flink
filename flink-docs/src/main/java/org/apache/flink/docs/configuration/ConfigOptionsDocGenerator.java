@@ -63,20 +63,24 @@ public class ConfigOptionsDocGenerator {
 		new OptionsClassLocation("flink-core", "org.apache.flink.configuration"),
 		new OptionsClassLocation("flink-runtime", "org.apache.flink.runtime.shuffle"),
 		new OptionsClassLocation("flink-runtime", "org.apache.flink.runtime.jobgraph"),
+		new OptionsClassLocation("flink-streaming-java", "org.apache.flink.streaming.api.environment"),
 		new OptionsClassLocation("flink-yarn", "org.apache.flink.yarn.configuration"),
 		new OptionsClassLocation("flink-mesos", "org.apache.flink.mesos.configuration"),
 		new OptionsClassLocation("flink-mesos", "org.apache.flink.mesos.runtime.clusterframework"),
 		new OptionsClassLocation("flink-metrics/flink-metrics-prometheus", "org.apache.flink.metrics.prometheus"),
 		new OptionsClassLocation("flink-state-backends/flink-statebackend-rocksdb", "org.apache.flink.contrib.streaming.state"),
 		new OptionsClassLocation("flink-table/flink-table-api-java", "org.apache.flink.table.api.config"),
-		new OptionsClassLocation("flink-python", "org.apache.flink.python")
+		new OptionsClassLocation("flink-python", "org.apache.flink.python"),
+		new OptionsClassLocation("flink-kubernetes", "org.apache.flink.kubernetes.configuration")
 	};
 
 	static final Set<String> EXCLUSIONS = new HashSet<>(Arrays.asList(
 		"org.apache.flink.configuration.ReadableConfig",
 		"org.apache.flink.configuration.WritableConfig",
 		"org.apache.flink.configuration.ConfigOptions",
-		"org.apache.flink.contrib.streaming.state.PredefinedOptions"));
+		"org.apache.flink.streaming.api.environment.CheckpointConfig",
+		"org.apache.flink.contrib.streaming.state.PredefinedOptions",
+		"org.apache.flink.python.PythonConfig"));
 
 	static final String DEFAULT_PATH_PREFIX = "src/main/java";
 

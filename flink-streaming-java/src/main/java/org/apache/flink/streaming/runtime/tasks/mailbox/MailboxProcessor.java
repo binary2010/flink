@@ -18,15 +18,18 @@
 package org.apache.flink.streaming.runtime.tasks.mailbox;
 
 import org.apache.flink.annotation.Internal;
-import org.apache.flink.runtime.concurrent.FutureUtils;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.streaming.api.operators.MailboxExecutor;
+import org.apache.flink.streaming.runtime.tasks.StreamTaskActionExecutor;
+import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.WrappingRuntimeException;
+import org.apache.flink.util.function.RunnableWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
+import java.io.Closeable;
 import java.util.List;
 import java.util.Optional;
 
@@ -54,7 +57,7 @@ import static org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox.MIN_P
  * encapsulated {@link TaskMailbox} (which is open-quiesce-close).
  */
 @Internal
-public class MailboxProcessor {
+public class MailboxProcessor implements Closeable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(MailboxProcessor.class);
 
@@ -77,12 +80,36 @@ public class MailboxProcessor {
 	 */
 	private MailboxDefaultAction.Suspension suspendedDefaultAction;
 
+	private final StreamTaskActionExecutor actionExecutor;
+
 	public MailboxProcessor(MailboxDefaultAction mailboxDefaultAction) {
+		this(mailboxDefaultAction, StreamTaskActionExecutor.IMMEDIATE);
+	}
+
+	public MailboxProcessor(
+			MailboxDefaultAction mailboxDefaultAction,
+			StreamTaskActionExecutor actionExecutor) {
+		this(mailboxDefaultAction, new TaskMailboxImpl(Thread.currentThread()), actionExecutor);
+	}
+
+	public MailboxProcessor(
+			MailboxDefaultAction mailboxDefaultAction,
+			TaskMailbox mailbox,
+			StreamTaskActionExecutor actionExecutor) {
+		this(mailboxDefaultAction, actionExecutor, mailbox, new MailboxExecutorImpl(mailbox, MIN_PRIORITY, actionExecutor));
+	}
+
+	public MailboxProcessor(
+			MailboxDefaultAction mailboxDefaultAction,
+			StreamTaskActionExecutor actionExecutor,
+			TaskMailbox mailbox,
+			MailboxExecutor mainMailboxExecutor) {
 		this.mailboxDefaultAction = Preconditions.checkNotNull(mailboxDefaultAction);
-		mailbox = new TaskMailboxImpl(Thread.currentThread());
-		mainMailboxExecutor = new MailboxExecutorImpl(mailbox, TaskMailbox.MIN_PRIORITY);
-		mailboxLoopRunning = true;
-		suspendedDefaultAction = null;
+		this.actionExecutor = Preconditions.checkNotNull(actionExecutor);
+		this.mailbox = Preconditions.checkNotNull(mailbox);
+		this.mainMailboxExecutor = Preconditions.checkNotNull(mainMailboxExecutor);
+		this.mailboxLoopRunning = true;
+		this.suspendedDefaultAction = null;
 	}
 
 	/**
@@ -98,7 +125,7 @@ public class MailboxProcessor {
 	 * @param priority the priority of the {@link MailboxExecutor}.
 	 */
 	public MailboxExecutor getMailboxExecutor(int priority) {
-		return new MailboxExecutorImpl(mailbox, priority);
+		return new MailboxExecutorImpl(mailbox, priority, actionExecutor);
 	}
 
 	/**
@@ -112,16 +139,22 @@ public class MailboxProcessor {
 	 * Lifecycle method to close the mailbox for action submission/retrieval. This will cancel all instances of
 	 * {@link java.util.concurrent.RunnableFuture} that are still contained in the mailbox.
 	 */
+	@Override
 	public void close() {
 		List<Mail> droppedMails = mailbox.close();
 		if (!droppedMails.isEmpty()) {
 			LOG.debug("Closing the mailbox dropped mails {}.", droppedMails);
-			List<Runnable> runnables = new ArrayList<>();
+			Optional<RuntimeException> maybeErr = Optional.empty();
 			for (Mail droppedMail : droppedMails) {
-				Runnable runnable = droppedMail.getRunnable();
-				runnables.add(runnable);
+				try {
+					droppedMail.tryCancel(false);
+				} catch (RuntimeException x) {
+					maybeErr = Optional.of(ExceptionUtils.firstOrSuppressed(x, maybeErr.orElse(null)));
+				}
 			}
-			FutureUtils.cancelRunnableFutures(runnables);
+			maybeErr.ifPresent(e -> {
+				throw e;
+			});
 		}
 	}
 
@@ -129,7 +162,7 @@ public class MailboxProcessor {
 	 * Finishes running all mails in the mailbox. If no concurrent write operations occurred, the mailbox must be
 	 * empty after this method.
 	 */
-	public void drain() {
+	public void drain() throws Exception {
 		for (final Mail mail : mailbox.drain()) {
 			mail.run();
 		}
@@ -151,7 +184,7 @@ public class MailboxProcessor {
 		final MailboxController defaultActionContext = new MailboxController(this);
 
 		while (processMail(localMailbox)) {
-			mailboxDefaultAction.runDefaultAction(defaultActionContext);
+			mailboxDefaultAction.runDefaultAction(defaultActionContext); // lock is acquired inside default action as needed
 		}
 	}
 
@@ -160,9 +193,17 @@ public class MailboxProcessor {
 	 * @param throwable to report by rethrowing from the mailbox loop.
 	 */
 	public void reportThrowable(Throwable throwable) {
-		sendPriorityMail(
+		sendControlMail(
 			() -> {
-				throw WrappingRuntimeException.wrapIfNecessary(throwable);
+				if (throwable instanceof Exception) {
+					throw (Exception) throwable;
+				}
+				else if (throwable instanceof Error) {
+					throw (Error) throwable;
+				}
+				else {
+					throw WrappingRuntimeException.wrapIfNecessary(throwable);
+				}
 			},
 			"Report throwable %s", throwable);
 	}
@@ -175,13 +216,21 @@ public class MailboxProcessor {
 			// keep state check and poison mail enqueuing atomic, such that no intermediate #close may cause a
 			// MailboxStateException in #sendPriorityMail.
 			if (mailbox.getState() == TaskMailbox.State.OPEN) {
-				sendPriorityMail(() -> mailboxLoopRunning = false, "poison mail");
+				sendControlMail(() -> mailboxLoopRunning = false, "poison mail");
 			}
 		});
 	}
 
-	private void sendPriorityMail(Runnable priorityMail, String descriptionFormat, Object... descriptionArgs) {
-		mainMailboxExecutor.executeFirst(priorityMail, descriptionFormat, descriptionArgs);
+	/**
+	 * Sends the given <code>mail</code> using {@link TaskMailbox#putFirst(Mail)} .
+	 * Intended use is to control this <code>MailboxProcessor</code>; no interaction with tasks should be performed;
+	 */
+	private void sendControlMail(RunnableWithException mail, String descriptionFormat, Object... descriptionArgs) {
+		mailbox.putFirst(new Mail(
+				mail,
+				Integer.MAX_VALUE /*not used with putFirst*/,
+				descriptionFormat,
+				descriptionArgs));
 	}
 
 	/**
@@ -190,7 +239,7 @@ public class MailboxProcessor {
 	 * changes. This keeps the hot path in {@link #runMailboxLoop()} free from any other flag checking, at the cost
 	 * that all flag changes must make sure that the mailbox signals mailbox#hasMail.
 	 */
-	private boolean processMail(TaskMailbox mailbox) throws InterruptedException {
+	private boolean processMail(TaskMailbox mailbox) throws Exception {
 
 		// Doing this check is an optimization to only have a volatile read in the expected hot path, locks are only
 		// acquired after this point.
@@ -231,7 +280,8 @@ public class MailboxProcessor {
 		return suspendedDefaultAction;
 	}
 
-	private boolean isDefaultActionUnavailable() {
+	@VisibleForTesting
+	public boolean isDefaultActionUnavailable() {
 		return suspendedDefaultAction != null;
 	}
 
@@ -245,7 +295,7 @@ public class MailboxProcessor {
 	private void ensureControlFlowSignalCheck() {
 		// Make sure that mailbox#hasMail is true via a dummy mail so that the flag change is noticed.
 		if (!mailbox.hasMail()) {
-			sendPriorityMail(() -> {}, "signal check");
+			sendControlMail(() -> {}, "signal check");
 		}
 	}
 
@@ -282,7 +332,7 @@ public class MailboxProcessor {
 			if (mailbox.isMailboxThread()) {
 				resumeInternal();
 			} else {
-				sendPriorityMail(this::resumeInternal, "resume default action");
+				sendControlMail(this::resumeInternal, "resume default action");
 			}
 		}
 

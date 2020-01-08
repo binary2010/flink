@@ -133,7 +133,8 @@ Create a TableEnvironment
 The `TableEnvironment` is a central concept of the Table API and SQL integration. It is responsible for:
 
 * Registering a `Table` in the internal catalog
-* Registering an external catalog 
+* Registering catalogs
+* Loading pluggable modules
 * Executing SQL queries
 * Registering a user-defined (scalar, table, or aggregation) function
 * Converting a `DataStream` or `DataSet` into a `Table`
@@ -585,7 +586,7 @@ revenue = orders \
 
 Flink's SQL integration is based on [Apache Calcite](https://calcite.apache.org), which implements the SQL standard. SQL queries are specified as regular Strings.
 
-The [SQL]({{ site.baseurl }}/dev/table/sql.html) document describes Flink's SQL support for streaming and batch tables.
+The [SQL]({{ site.baseurl }}/dev/table/sql/index.html) document describes Flink's SQL support for streaming and batch tables.
 
 The following example shows how to specify a query and return the result as a `Table`.
 

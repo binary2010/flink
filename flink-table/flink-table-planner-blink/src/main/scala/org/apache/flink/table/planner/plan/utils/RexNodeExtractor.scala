@@ -18,24 +18,26 @@
 
 package org.apache.flink.table.planner.plan.utils
 
+import org.apache.flink.annotation.VisibleForTesting
 import org.apache.flink.table.api.TableException
 import org.apache.flink.table.catalog.{CatalogManager, FunctionCatalog, FunctionLookup, UnresolvedIdentifier}
-import org.apache.flink.table.dataformat.DataFormatConverters.{LocalDateConverter, LocalDateTimeConverter, LocalTimeConverter}
+import org.apache.flink.table.dataformat.DataFormatConverters.{LocalDateConverter, LocalTimeConverter}
 import org.apache.flink.table.expressions._
 import org.apache.flink.table.expressions.utils.ApiExpressionUtils._
 import org.apache.flink.table.functions.BuiltInFunctionDefinitions.{AND, CAST, OR}
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory
 import org.apache.flink.table.planner.utils.Logging
-import org.apache.flink.table.runtime.functions.SqlDateTimeUtils.unixTimestampToLocalDateTime
 import org.apache.flink.table.runtime.types.LogicalTypeDataTypeConverter.fromLogicalTypeToDataType
 import org.apache.flink.table.types.DataType
 import org.apache.flink.table.types.logical.LogicalTypeRoot._
+import org.apache.flink.table.util.TimestampStringUtils.toLocalDateTime
 import org.apache.flink.util.Preconditions
+
 import org.apache.calcite.plan.RelOptUtil
 import org.apache.calcite.rex._
 import org.apache.calcite.sql.fun.{SqlStdOperatorTable, SqlTrimFunction}
 import org.apache.calcite.sql.{SqlFunction, SqlPostfixOperator}
-import org.apache.calcite.util.Util
+import org.apache.calcite.util.{TimestampString, Util}
 
 import java.util
 import java.util.{TimeZone, List => JList}
@@ -114,6 +116,24 @@ object RexNodeExtractor extends Logging {
     (convertedExpressions.toArray, unconvertedRexNodes.toArray)
   }
 
+  @VisibleForTesting
+  def extractPartitionPredicates(
+      expr: RexNode,
+      maxCnfNodeCount: Int,
+      inputFieldNames: Array[String],
+      rexBuilder: RexBuilder,
+      partitionFieldNames: Array[String]): (RexNode, RexNode) = {
+    val (partitionPredicates, nonPartitionPredicates) = extractPartitionPredicateList(
+      expr,
+      maxCnfNodeCount,
+      inputFieldNames,
+      rexBuilder,
+      partitionFieldNames)
+    val partitionPredicate = RexUtil.composeConjunction(rexBuilder, partitionPredicates)
+    val nonPartitionPredicate = RexUtil.composeConjunction(rexBuilder, nonPartitionPredicates)
+    (partitionPredicate, nonPartitionPredicate)
+  }
+
   /**
     * Extract partition predicate from filter condition.
     *
@@ -123,12 +143,12 @@ object RexNodeExtractor extends Logging {
     * @param partitionFieldNames Partition field names.
     * @return Partition predicates and non-partition predicates.
     */
-  def extractPartitionPredicates(
+  def extractPartitionPredicateList(
       expr: RexNode,
       maxCnfNodeCount: Int,
       inputFieldNames: Array[String],
       rexBuilder: RexBuilder,
-      partitionFieldNames: Array[String]): (RexNode, RexNode) = {
+      partitionFieldNames: Array[String]): (Seq[RexNode], Seq[RexNode]) = {
     // converts the expanded expression to conjunctive normal form,
     // like "(a AND b) OR c" will be converted to "(a OR c) AND (b OR c)"
     val cnf = FlinkRexUtil.toCnf(rexBuilder, maxCnfNodeCount, expr)
@@ -137,9 +157,7 @@ object RexNodeExtractor extends Logging {
 
     val (partitionPredicates, nonPartitionPredicates) =
       conjunctions.partition(isSupportedPartitionPredicate(_, partitionFieldNames, inputFieldNames))
-    val partitionPredicate = RexUtil.composeConjunction(rexBuilder, partitionPredicates)
-    val nonPartitionPredicate = RexUtil.composeConjunction(rexBuilder, nonPartitionPredicates)
-    (partitionPredicate, nonPartitionPredicate)
+    (partitionPredicates, nonPartitionPredicates)
   }
 
   /**
@@ -337,12 +355,12 @@ class RexNodeToExpressionConverter(
         LocalTimeConverter.INSTANCE.toExternal(v)
 
       case TIMESTAMP_WITHOUT_TIME_ZONE =>
-        val v = literal.getValueAs(classOf[java.lang.Long])
-        LocalDateTimeConverter.INSTANCE.toExternal(v)
+        val v = literal.getValueAs(classOf[TimestampString])
+        toLocalDateTime(v)
 
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE =>
-        val v = literal.getValueAs(classOf[java.lang.Long])
-        unixTimestampToLocalDateTime(v).atZone(timeZone.toZoneId).toInstant
+        val v = literal.getValueAs(classOf[TimestampString])
+        toLocalDateTime(v).atZone(timeZone.toZoneId).toInstant
 
       case TINYINT =>
         // convert from BigDecimal to Byte

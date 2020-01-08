@@ -18,12 +18,16 @@
 package org.apache.flink.streaming.runtime.tasks.mailbox;
 
 import org.apache.flink.core.testutils.OneShotLatch;
+import org.apache.flink.runtime.concurrent.FutureTaskWithException;
 import org.apache.flink.streaming.api.operators.MailboxExecutor;
+import org.apache.flink.util.FlinkException;
+import org.apache.flink.util.function.RunnableWithException;
 
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -35,6 +39,9 @@ import java.util.concurrent.atomic.AtomicReference;
 public class TaskMailboxProcessorTest {
 
 	public static final int DEFAULT_PRIORITY = 0;
+
+	@Rule
+	public ExpectedException expectedException = ExpectedException.none();
 
 	@Test
 	public void testRejectIfNotOpen() {
@@ -48,9 +55,29 @@ public class TaskMailboxProcessorTest {
 	}
 
 	@Test
+	public void testSubmittingRunnableWithException() throws Exception {
+		expectedException.expectMessage("Expected");
+		try (MailboxProcessor mailboxProcessor = new MailboxProcessor(controller -> {})) {
+			final Thread submitThread = new Thread(() -> {
+				mailboxProcessor.getMainMailboxExecutor().execute(
+					this::throwFlinkException,
+					"testSubmittingRunnableWithException");
+			});
+
+			submitThread.start();
+			mailboxProcessor.runMailboxLoop();
+			submitThread.join();
+		}
+	}
+
+	private void throwFlinkException() throws FlinkException {
+		throw new FlinkException("Expected");
+	}
+
+	@Test
 	public void testShutdown() {
 		MailboxProcessor mailboxProcessor = new MailboxProcessor(controller -> {});
-		FutureTask<Void> testRunnableFuture = new FutureTask<>(() -> {}, null);
+		FutureTaskWithException<Void> testRunnableFuture = new FutureTaskWithException<>(() -> {});
 		mailboxProcessor.getMailboxExecutor(DEFAULT_PRIORITY).execute(testRunnableFuture, "testRunnableFuture");
 		mailboxProcessor.prepareClose();
 
@@ -82,7 +109,7 @@ public class TaskMailboxProcessorTest {
 
 		MailboxProcessor mailboxProcessor = start(mailboxThread);
 		mailboxProcessor.getMailboxExecutor(DEFAULT_PRIORITY).execute(() -> stop.set(true), "stop");
-		stop(mailboxThread);
+		mailboxThread.join();
 	}
 
 	@Test
@@ -100,7 +127,7 @@ public class TaskMailboxProcessorTest {
 		};
 
 		start(mailboxThread);
-		stop(mailboxThread);
+		mailboxThread.join();
 		Assert.assertEquals(expectedInvocations, counter.get());
 	}
 
@@ -131,7 +158,7 @@ public class TaskMailboxProcessorTest {
 
 		MailboxDefaultAction.Suspension suspension = suspendedActionRef.get();
 		mailboxProcessor.getMailboxExecutor(DEFAULT_PRIORITY).execute(suspension::resume, "resume");
-		stop(mailboxThread);
+		mailboxThread.join();
 		Assert.assertEquals(totalInvocations, counter.get());
 	}
 
@@ -196,8 +223,6 @@ public class TaskMailboxProcessorTest {
 		mailboxThread.join();
 		asyncUnblocker.interrupt();
 		asyncUnblocker.join();
-		mailboxProcessor.prepareClose();
-		mailboxProcessor.close();
 		mailboxThread.checkException();
 	}
 
@@ -240,26 +265,19 @@ public class TaskMailboxProcessorTest {
 		final MailboxExecutor mailboxExecutor = mailboxProcessor.getMailboxExecutor(DEFAULT_PRIORITY);
 		AtomicInteger index = new AtomicInteger();
 		mailboxExecutor.execute(
-			new Runnable() {
+			new RunnableWithException() {
 				@Override
 				public void run() {
 					mailboxExecutor.execute(this, "Blocking mail" + index.incrementAndGet());
 				}
 			},
-			"Blocking mail" + index);
+			"Blocking mail" + index.get());
 
 		mailboxThread.signalStart();
-		stop(mailboxThread);
+		mailboxThread.join();
+
 		Assert.assertEquals(expectedInvocations, counter.get());
 		Assert.assertEquals(expectedInvocations, index.get());
-	}
-
-	private static void stop(MailboxThread mailboxThread) throws Exception {
-		mailboxThread.join();
-		MailboxProcessor mailboxProcessor = mailboxThread.getMailboxProcessor();
-		mailboxProcessor.prepareClose();
-		mailboxProcessor.close();
-		mailboxThread.checkException();
 	}
 
 	static class MailboxThread extends Thread implements MailboxDefaultAction {

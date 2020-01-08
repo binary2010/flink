@@ -1001,4 +1001,43 @@ public class BinaryRowTest {
 			assertEquals(row160, rets.get(1));
 		}
 	}
+
+	@Test
+	public void testSqlTimestamp() {
+		// 1. compact
+		{
+			final int precision = 3;
+			BinaryRow row = new BinaryRow(2);
+			BinaryRowWriter writer = new BinaryRowWriter(row);
+			writer.writeTimestamp(0, SqlTimestamp.fromEpochMillis(123L), precision);
+			writer.setNullAt(1);
+			writer.complete();
+
+			assertEquals("1970-01-01T00:00:00.123", row.getTimestamp(0, 3).toString());
+			assertTrue(row.isNullAt(1));
+			row.setTimestamp(0, SqlTimestamp.fromEpochMillis(-123L), precision);
+			assertEquals("1969-12-31T23:59:59.877", row.getTimestamp(0, 3).toString());
+		}
+
+		// 2. not compact
+		{
+			final int precision = 9;
+			SqlTimestamp sqlTimestamp1 = SqlTimestamp.fromLocalDateTime(LocalDateTime.of(1969, 1, 1, 0, 0, 0, 123456789));
+			SqlTimestamp sqlTimestamp2 = SqlTimestamp.fromTimestamp(Timestamp.valueOf("1970-01-01 00:00:00.123456789"));
+			BinaryRow row = new BinaryRow(2);
+			BinaryRowWriter writer = new BinaryRowWriter(row);
+			writer.writeTimestamp(0, sqlTimestamp1, precision);
+			writer.writeTimestamp(1, null, precision);
+			writer.complete();
+
+			// the size of row should be 8 + (8 + 8) * 2
+			// (8 bytes nullBits, 8 bytes fixed-length part and 8 bytes variable-length part for each timestamp(9))
+			assertEquals(40, row.getSizeInBytes());
+
+			assertEquals("1969-01-01T00:00:00.123456789", row.getTimestamp(0, precision).toString());
+			assertTrue(row.isNullAt(1));
+			row.setTimestamp(0, sqlTimestamp2, precision);
+			assertEquals("1970-01-01T00:00:00.123456789", row.getTimestamp(0, precision).toString());
+		}
+	}
 }

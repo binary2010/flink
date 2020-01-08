@@ -21,6 +21,7 @@ package org.apache.flink.runtime.util;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.core.io.InputSplit;
 import org.apache.flink.core.testutils.CommonTestUtils;
@@ -30,6 +31,7 @@ import org.apache.flink.runtime.blob.TransientBlobCache;
 import org.apache.flink.runtime.broadcast.BroadcastVariableManager;
 import org.apache.flink.runtime.checkpoint.CheckpointMetrics;
 import org.apache.flink.runtime.checkpoint.TaskStateSnapshot;
+import org.apache.flink.runtime.clusterframework.TaskExecutorResourceUtils;
 import org.apache.flink.runtime.clusterframework.types.AllocationID;
 import org.apache.flink.runtime.deployment.InputGateDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
@@ -167,7 +169,11 @@ public class JvmExitOnFatalErrorTest {
 
 				final ShuffleEnvironment<?, ?> shuffleEnvironment = new NettyShuffleEnvironmentBuilder().build();
 
-				final TaskManagerRuntimeInfo tmInfo = TaskManagerConfiguration.fromConfiguration(taskManagerConfig);
+				final Configuration copiedConf = new Configuration(taskManagerConfig);
+				copiedConf.set(TaskManagerOptions.TOTAL_FLINK_MEMORY, MemorySize.parse("1024m"));
+
+				final TaskManagerRuntimeInfo tmInfo = TaskManagerConfiguration
+					.fromConfiguration(taskManagerConfig, TaskExecutorResourceUtils.resourceSpecFromConfig(copiedConf));
 
 				final Executor executor = Executors.newCachedThreadPool();
 

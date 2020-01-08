@@ -68,17 +68,21 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
 import static org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfiguration.MINIMAL_CHECKPOINT_TIME;
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * The StreamingJobGraphGenerator converts a {@link StreamGraph} into a {@link JobGraph}.
@@ -87,6 +91,8 @@ import static org.apache.flink.runtime.jobgraph.tasks.CheckpointCoordinatorConfi
 public class StreamingJobGraphGenerator {
 
 	private static final Logger LOG = LoggerFactory.getLogger(StreamingJobGraphGenerator.class);
+
+	private static final int MANAGED_MEMORY_FRACTION_SCALE = 16;
 
 	// ------------------------------------------------------------------------
 
@@ -162,6 +168,13 @@ public class StreamingJobGraphGenerator {
 		setPhysicalEdges();
 
 		setSlotSharingAndCoLocation();
+
+		setManagedMemoryFraction(
+			Collections.unmodifiableMap(jobVertices),
+			Collections.unmodifiableMap(vertexConfigs),
+			Collections.unmodifiableMap(chainedConfigs),
+			id -> streamGraph.getStreamNode(id).getMinResources(),
+			id -> streamGraph.getStreamNode(id).getManagedMemoryWeight());
 
 		configureCheckpointing();
 
@@ -682,6 +695,114 @@ public class StreamingJobGraphGenerator {
 				constraint.f1.addVertex(vertex);
 			}
 		}
+	}
+
+	private static void setManagedMemoryFraction(
+			final Map<Integer, JobVertex> jobVertices,
+			final Map<Integer, StreamConfig> operatorConfigs,
+			final Map<Integer, Map<Integer, StreamConfig>> vertexChainedConfigs,
+			final java.util.function.Function<Integer, ResourceSpec> operatorResourceRetriever,
+			final java.util.function.Function<Integer, Integer> operatorManagedMemoryWeightRetriever) {
+
+		// all slot sharing groups in this job
+		final Set<SlotSharingGroup> slotSharingGroups = Collections.newSetFromMap(new IdentityHashMap<>());
+
+		// maps a job vertex ID to its head operator ID
+		final Map<JobVertexID, Integer> vertexHeadOperators = new HashMap<>();
+
+		// maps a job vertex ID to IDs of all operators in the vertex
+		final Map<JobVertexID, Set<Integer>> vertexOperators = new HashMap<>();
+
+		for (Entry<Integer, JobVertex> entry : jobVertices.entrySet()) {
+			final int headOperatorId = entry.getKey();
+			final JobVertex jobVertex = entry.getValue();
+
+			final SlotSharingGroup jobVertexSlotSharingGroup = jobVertex.getSlotSharingGroup();
+
+			checkState(jobVertexSlotSharingGroup != null, "JobVertex slot sharing group must not be null");
+			slotSharingGroups.add(jobVertexSlotSharingGroup);
+
+			vertexHeadOperators.put(jobVertex.getID(), headOperatorId);
+
+			final Set<Integer> operatorIds = new HashSet<>();
+			operatorIds.add(headOperatorId);
+			operatorIds.addAll(vertexChainedConfigs.getOrDefault(headOperatorId, Collections.emptyMap()).keySet());
+			vertexOperators.put(jobVertex.getID(), operatorIds);
+		}
+
+		for (SlotSharingGroup slotSharingGroup : slotSharingGroups) {
+			setManagedMemoryFractionForSlotSharingGroup(
+				slotSharingGroup,
+				vertexHeadOperators,
+				vertexOperators,
+				operatorConfigs,
+				vertexChainedConfigs,
+				operatorResourceRetriever,
+				operatorManagedMemoryWeightRetriever);
+		}
+	}
+
+	private static void setManagedMemoryFractionForSlotSharingGroup(
+			final SlotSharingGroup slotSharingGroup,
+			final Map<JobVertexID, Integer> vertexHeadOperators,
+			final Map<JobVertexID, Set<Integer>> vertexOperators,
+			final Map<Integer, StreamConfig> operatorConfigs,
+			final Map<Integer, Map<Integer, StreamConfig>> vertexChainedConfigs,
+			final java.util.function.Function<Integer, ResourceSpec> operatorResourceRetriever,
+			final java.util.function.Function<Integer, Integer> operatorManagedMemoryWeightRetriever) {
+
+		final int groupManagedMemoryWeight = slotSharingGroup.getJobVertexIds().stream()
+			.flatMap(vid -> vertexOperators.get(vid).stream())
+			.mapToInt(operatorManagedMemoryWeightRetriever::apply)
+			.sum();
+
+		for (JobVertexID jobVertexID : slotSharingGroup.getJobVertexIds()) {
+			for (int operatorNodeId : vertexOperators.get(jobVertexID)) {
+				final StreamConfig operatorConfig = operatorConfigs.get(operatorNodeId);
+				final ResourceSpec operatorResourceSpec = operatorResourceRetriever.apply(operatorNodeId);
+				final int operatorManagedMemoryWeight = operatorManagedMemoryWeightRetriever.apply(operatorNodeId);
+				setManagedMemoryFractionForOperator(
+					operatorResourceSpec,
+					slotSharingGroup.getResourceSpec(),
+					operatorManagedMemoryWeight,
+					groupManagedMemoryWeight,
+					operatorConfig);
+			}
+
+			// need to refresh the chained task configs because they are serialized
+			final int headOperatorNodeId = vertexHeadOperators.get(jobVertexID);
+			final StreamConfig vertexConfig = operatorConfigs.get(headOperatorNodeId);
+			vertexConfig.setTransitiveChainedTaskConfigs(vertexChainedConfigs.get(headOperatorNodeId));
+		}
+	}
+
+	private static void setManagedMemoryFractionForOperator(
+			final ResourceSpec operatorResourceSpec,
+			final ResourceSpec groupResourceSpec,
+			final int operatorManagedMemoryWeight,
+			final int groupManagedMemoryWeight,
+			final StreamConfig operatorConfig) {
+
+		final double managedMemoryFraction;
+
+		if (groupResourceSpec.equals(ResourceSpec.UNKNOWN)) {
+			managedMemoryFraction = groupManagedMemoryWeight > 0
+				? getFractionRoundedDown(operatorManagedMemoryWeight, groupManagedMemoryWeight)
+				: 0.0;
+		} else {
+			final long groupManagedMemoryBytes = groupResourceSpec.getManagedMemory().getBytes();
+			managedMemoryFraction = groupManagedMemoryBytes > 0
+				? getFractionRoundedDown(operatorResourceSpec.getManagedMemory().getBytes(), groupManagedMemoryBytes)
+				: 0.0;
+		}
+
+		operatorConfig.setManagedMemoryFraction(managedMemoryFraction);
+	}
+
+	private static double getFractionRoundedDown(final long dividend, final long divisor) {
+		return BigDecimal.valueOf(dividend)
+			.divide(BigDecimal.valueOf(divisor), MANAGED_MEMORY_FRACTION_SCALE, BigDecimal.ROUND_DOWN)
+			.doubleValue();
 	}
 
 	private void configureCheckpointing() {

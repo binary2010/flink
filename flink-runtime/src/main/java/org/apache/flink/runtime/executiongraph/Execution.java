@@ -73,6 +73,7 @@ import javax.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -82,7 +83,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -95,6 +95,7 @@ import static org.apache.flink.runtime.execution.ExecutionState.FAILED;
 import static org.apache.flink.runtime.execution.ExecutionState.FINISHED;
 import static org.apache.flink.runtime.execution.ExecutionState.RUNNING;
 import static org.apache.flink.runtime.execution.ExecutionState.SCHEDULED;
+import static org.apache.flink.runtime.scheduler.ExecutionVertexSchedulingRequirementsMapper.getPhysicalSlotResourceProfile;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -117,9 +118,6 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * actions if it is not. Many actions are also idempotent (like canceling).
  */
 public class Execution implements AccessExecution, Archiveable<ArchivedExecution>, LogicalSlot.Payload {
-
-	private static final AtomicReferenceFieldUpdater<Execution, ExecutionState> STATE_UPDATER =
-			AtomicReferenceFieldUpdater.newUpdater(Execution.class, ExecutionState.class, "state");
 
 	private static final Logger LOG = ExecutionGraph.LOG;
 
@@ -161,17 +159,17 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 	private volatile ExecutionState state = CREATED;
 
-	private volatile LogicalSlot assignedResource;
+	private LogicalSlot assignedResource;
 
-	private volatile Throwable failureCause;          // once assigned, never changes
+	private Throwable failureCause;          // once assigned, never changes
 
 	/** Information to restore the task on recovery, such as checkpoint id and task state snapshot. */
 	@Nullable
-	private volatile JobManagerTaskRestore taskRestore;
+	private JobManagerTaskRestore taskRestore;
 
 	/** This field holds the allocation id once it was assigned successfully. */
 	@Nullable
-	private volatile AllocationID assignedAllocationID;
+	private AllocationID assignedAllocationID;
 
 	// ------------------------ Accumulators & Metrics ------------------------
 
@@ -180,9 +178,9 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	private final Object accumulatorLock = new Object();
 
 	/* Continuously updated map of user-defined accumulators */
-	private volatile Map<String, Accumulator<?, ?>> userAccumulators;
+	private Map<String, Accumulator<?, ?>> userAccumulators;
 
-	private volatile IOMetrics ioMetrics;
+	private IOMetrics ioMetrics;
 
 	private Map<IntermediateResultPartitionID, ResultPartitionDeploymentDescriptor> producedPartitions;
 
@@ -544,8 +542,9 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 						slotProviderStrategy.allocateSlot(
 							slotRequestId,
 							toSchedule,
-							new SlotProfile(
+							SlotProfile.priorAllocation(
 								vertex.getResourceProfile(),
+								getPhysicalSlotResourceProfile(vertex),
 								preferredLocations,
 								previousAllocationIDs,
 								allPreviousExecutionGraphAllocationIds)));
@@ -840,9 +839,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	}
 
 	private void scheduleConsumer(ExecutionVertex consumerVertex) {
-		if (!isLegacyScheduling()) {
-			return;
-		}
+		assert isLegacyScheduling();
 
 		try {
 			final ExecutionGraph executionGraph = consumerVertex.getExecutionGraph();
@@ -859,10 +856,19 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	void scheduleOrUpdateConsumers(List<List<ExecutionEdge>> allConsumers) {
 		assertRunningInJobMasterMainThread();
 
-		final int numConsumers = allConsumers.size();
-		if (numConsumers > 1) {
+		final HashSet<ExecutionVertex> consumerDeduplicator = new HashSet<>();
+		scheduleOrUpdateConsumers(allConsumers, consumerDeduplicator);
+	}
+
+	private void scheduleOrUpdateConsumers(
+			final List<List<ExecutionEdge>> allConsumers,
+			final HashSet<ExecutionVertex> consumerDeduplicator) {
+
+		if (allConsumers.size() == 0) {
+			return;
+		}
+		if (allConsumers.size() > 1) {
 			fail(new IllegalStateException("Currently, only a single consumer group per partition is supported."));
-		} else if (numConsumers == 0) {
 			return;
 		}
 
@@ -872,8 +878,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			final ExecutionState consumerState = consumer.getState();
 
 			// ----------------------------------------------------------------
-			// Consumer is created => try to schedule it and the partition info
-			// is known during deployment
+			// Consumer is created => needs to be scheduled
 			// ----------------------------------------------------------------
 			if (consumerState == CREATED) {
 				// Schedule the consumer vertex if its inputs constraint is satisfied, otherwise skip the scheduling.
@@ -881,8 +886,10 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 				// at least one of the consumer vertex's inputs is consumable here. This is to avoid the
 				// O(N) complexity introduced by input constraint check for InputDependencyConstraint.ANY,
 				// as we do not want the default scheduling performance to be affected.
-				if (consumerVertex.getInputDependencyConstraint() == InputDependencyConstraint.ANY ||
-						consumerVertex.checkInputDependencyConstraints()) {
+				if (isLegacyScheduling() && consumerDeduplicator.add(consumerVertex) &&
+						(consumerVertex.getInputDependencyConstraint() == InputDependencyConstraint.ANY ||
+						consumerVertex.checkInputDependencyConstraints())) {
+
 					scheduleConsumer(consumerVertex);
 				}
 			}
@@ -1046,21 +1053,9 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 				if (transitionState(current, FINISHED)) {
 					try {
-						for (IntermediateResultPartition finishedPartition
-								: getVertex().finishAllBlockingPartitions()) {
-
-							IntermediateResultPartition[] allPartitions = finishedPartition
-									.getIntermediateResult().getPartitions();
-
-							for (IntermediateResultPartition partition : allPartitions) {
-								scheduleOrUpdateConsumers(partition.getConsumers());
-							}
-						}
-
+						finishPartitionsAndScheduleOrUpdateConsumers();
 						updateAccumulatorsAndMetrics(userAccumulators, metrics);
-
 						releaseAssignedResource(null);
-
 						vertex.getExecutionGraph().deregisterExecution(this);
 					}
 					finally {
@@ -1085,6 +1080,24 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 				// this should not happen, we need to fail this
 				markFailed(new Exception("Vertex received FINISHED message while being in state " + state));
 				return;
+			}
+		}
+	}
+
+	private void finishPartitionsAndScheduleOrUpdateConsumers() {
+		final List<IntermediateResultPartition> newlyFinishedResults = getVertex().finishAllBlockingPartitions();
+		if (newlyFinishedResults.isEmpty()) {
+			return;
+		}
+
+		final HashSet<ExecutionVertex> consumerDeduplicator = new HashSet<>();
+
+		for (IntermediateResultPartition finishedPartition : newlyFinishedResults) {
+			final IntermediateResultPartition[] allPartitionsOfNewlyFinishedResults =
+					finishedPartition.getIntermediateResult().getPartitions();
+
+			for (IntermediateResultPartition partition : allPartitionsOfNewlyFinishedResults) {
+				scheduleOrUpdateConsumers(partition.getConsumers(), consumerDeduplicator);
 			}
 		}
 	}
@@ -1504,7 +1517,8 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			throw new IllegalStateException("Cannot leave terminal state " + currentState + " to transition to " + targetState + '.');
 		}
 
-		if (STATE_UPDATER.compareAndSet(this, currentState, targetState)) {
+		if (state == currentState) {
+			state = targetState;
 			markTimestamp(targetState);
 
 			if (error == null) {

@@ -20,6 +20,7 @@ package org.apache.flink.table.catalog;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.ValidationException;
 import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
@@ -37,7 +38,7 @@ import org.apache.flink.table.functions.TableAggregateFunctionDefinition;
 import org.apache.flink.table.functions.TableFunction;
 import org.apache.flink.table.functions.TableFunctionDefinition;
 import org.apache.flink.table.functions.UserDefinedAggregateFunction;
-import org.apache.flink.table.functions.UserFunctionsTypeHelper;
+import org.apache.flink.table.functions.UserDefinedFunctionHelper;
 import org.apache.flink.table.module.ModuleManager;
 import org.apache.flink.util.Preconditions;
 
@@ -55,7 +56,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  */
 @Internal
 public class FunctionCatalog implements FunctionLookup {
-
+	private final TableConfig config;
 	private final CatalogManager catalogManager;
 	private final ModuleManager moduleManager;
 
@@ -67,7 +68,11 @@ public class FunctionCatalog implements FunctionLookup {
 	 */
 	private PlannerTypeInferenceUtil plannerTypeInferenceUtil;
 
-	public FunctionCatalog(CatalogManager catalogManager, ModuleManager moduleManager) {
+	public FunctionCatalog(
+			TableConfig config,
+			CatalogManager catalogManager,
+			ModuleManager moduleManager) {
+		this.config = checkNotNull(config);
 		this.catalogManager = checkNotNull(catalogManager);
 		this.moduleManager = checkNotNull(moduleManager);
 	}
@@ -77,7 +82,8 @@ public class FunctionCatalog implements FunctionLookup {
 	}
 
 	public void registerTempSystemScalarFunction(String name, ScalarFunction function) {
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
+
 		registerTempSystemFunction(
 			name,
 			new ScalarFunctionDefinition(name, function)
@@ -88,10 +94,7 @@ public class FunctionCatalog implements FunctionLookup {
 			String name,
 			TableFunction<T> function,
 			TypeInformation<T> resultType) {
-		// check if class not Scala object
-		UserFunctionsTypeHelper.validateNotSingleton(function.getClass());
-		// check if class could be instantiated
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
 
 		registerTempSystemFunction(
 			name,
@@ -107,10 +110,7 @@ public class FunctionCatalog implements FunctionLookup {
 			UserDefinedAggregateFunction<T, ACC> function,
 			TypeInformation<T> resultType,
 			TypeInformation<ACC> accType) {
-		// check if class not Scala object
-		UserFunctionsTypeHelper.validateNotSingleton(function.getClass());
-		// check if class could be instantiated
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
 
 		final FunctionDefinition definition;
 		if (function instanceof AggregateFunction) {
@@ -136,7 +136,8 @@ public class FunctionCatalog implements FunctionLookup {
 	}
 
 	public void registerTempCatalogScalarFunction(ObjectIdentifier oi, ScalarFunction function) {
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
+
 		registerTempCatalogFunction(
 			oi,
 			new ScalarFunctionDefinition(oi.getObjectName(), function)
@@ -147,10 +148,7 @@ public class FunctionCatalog implements FunctionLookup {
 			ObjectIdentifier oi,
 			TableFunction<T> function,
 			TypeInformation<T> resultType) {
-		// check if class not Scala object
-		UserFunctionsTypeHelper.validateNotSingleton(function.getClass());
-		// check if class could be instantiated
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
 
 		registerTempCatalogFunction(
 			oi,
@@ -166,10 +164,7 @@ public class FunctionCatalog implements FunctionLookup {
 			UserDefinedAggregateFunction<T, ACC> function,
 			TypeInformation<T> resultType,
 			TypeInformation<ACC> accType) {
-		// check if class not Scala object
-		UserFunctionsTypeHelper.validateNotSingleton(function.getClass());
-		// check if class could be instantiated
-		UserFunctionsTypeHelper.validateInstantiation(function.getClass());
+		UserDefinedFunctionHelper.prepareFunction(config, function);
 
 		final FunctionDefinition definition;
 		if (function instanceof AggregateFunction) {
@@ -192,6 +187,26 @@ public class FunctionCatalog implements FunctionLookup {
 			oi,
 			definition
 		);
+	}
+
+	/**
+	 * Check whether a temporary catalog function is already registered.
+	 * @param functionIdentifier the object identifier of function
+	 * @return whether the temporary catalog function exists in the function catalog
+	 */
+	public boolean hasTemporaryCatalogFunction(ObjectIdentifier functionIdentifier) {
+		ObjectIdentifier normalizedIdentifier =
+			FunctionIdentifier.normalizeObjectIdentifier(functionIdentifier);
+		return tempCatalogFunctions.containsKey(normalizedIdentifier);
+	}
+
+	/**
+	 * Check whether a temporary system function is already registered.
+	 * @param functionName the name of the function
+	 * @return whether the temporary system function exists in the function catalog
+	 */
+	public boolean hasTemporarySystemFunction(String functionName) {
+		return tempSystemFunctions.containsKey(functionName);
 	}
 
 	/**
@@ -318,7 +333,8 @@ public class FunctionCatalog implements FunctionLookup {
 					fd = catalog.getFunctionDefinitionFactory().get()
 						.createFunctionDefinition(oi.getObjectName(), catalogFunction);
 				} else {
-					fd = FunctionDefinitionUtil.createFunctionDefinition(oi.getObjectName(), catalogFunction);
+					fd = FunctionDefinitionUtil.createFunctionDefinition(
+						oi.getObjectName(), catalogFunction.getClassName());
 				}
 
 				return Optional.of(
@@ -358,7 +374,7 @@ public class FunctionCatalog implements FunctionLookup {
 		)).orElseGet(() -> resolvePreciseFunctionReference(oi));
 	}
 
-		@Override
+	@Override
 	public PlannerTypeInferenceUtil getPlannerTypeInferenceUtil() {
 		Preconditions.checkNotNull(
 			plannerTypeInferenceUtil,

@@ -25,6 +25,7 @@ import org.apache.flink.table.api.TableColumn;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.catalog.Catalog;
+import org.apache.flink.table.catalog.CatalogDatabaseImpl;
 import org.apache.flink.table.catalog.CatalogFunction;
 import org.apache.flink.table.catalog.CatalogFunctionImpl;
 import org.apache.flink.table.catalog.CatalogManager;
@@ -41,7 +42,14 @@ import org.apache.flink.table.catalog.exceptions.TableNotExistException;
 import org.apache.flink.table.module.ModuleManager;
 import org.apache.flink.table.operations.CatalogSinkModifyOperation;
 import org.apache.flink.table.operations.Operation;
+import org.apache.flink.table.operations.UseCatalogOperation;
+import org.apache.flink.table.operations.UseDatabaseOperation;
+import org.apache.flink.table.operations.ddl.AlterDatabaseOperation;
+import org.apache.flink.table.operations.ddl.AlterTablePropertiesOperation;
+import org.apache.flink.table.operations.ddl.AlterTableRenameOperation;
+import org.apache.flink.table.operations.ddl.CreateDatabaseOperation;
 import org.apache.flink.table.operations.ddl.CreateTableOperation;
+import org.apache.flink.table.operations.ddl.DropDatabaseOperation;
 import org.apache.flink.table.planner.calcite.CalciteParser;
 import org.apache.flink.table.planner.calcite.FlinkPlannerImpl;
 import org.apache.flink.table.planner.catalog.CatalogManagerCalciteSchema;
@@ -61,7 +69,6 @@ import javax.annotation.Nullable;
 
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -82,7 +89,10 @@ public class SqlToOperationConverterTest {
 	private final CatalogManager catalogManager =
 		new CatalogManager("builtin", catalog);
 	private final ModuleManager moduleManager = new ModuleManager();
-	private final FunctionCatalog functionCatalog = new FunctionCatalog(catalogManager, moduleManager);
+	private final FunctionCatalog functionCatalog = new FunctionCatalog(
+		tableConfig,
+		catalogManager,
+		moduleManager);
 	private final PlannerContext plannerContext =
 		new PlannerContext(tableConfig,
 			functionCatalog,
@@ -116,6 +126,112 @@ public class SqlToOperationConverterTest {
 	}
 
 	@Test
+	public void testUseCatalog() {
+		final String sql = "USE CATALOG cat1";
+		Operation operation = parse(sql, SqlDialect.DEFAULT);
+		assert operation instanceof UseCatalogOperation;
+		assertEquals("cat1", ((UseCatalogOperation) operation).getCatalogName());
+	}
+
+	@Test
+	public void testUseDatabase() {
+		final String sql1 = "USE db1";
+		Operation operation1 = parse(sql1, SqlDialect.DEFAULT);
+		assert operation1 instanceof UseDatabaseOperation;
+		assertEquals("builtin", ((UseDatabaseOperation) operation1).getCatalogName());
+		assertEquals("db1", ((UseDatabaseOperation) operation1).getDatabaseName());
+
+		final String sql2 = "USE cat1.db1";
+		Operation operation2 = parse(sql2, SqlDialect.DEFAULT);
+		assert operation2 instanceof UseDatabaseOperation;
+		assertEquals("cat1", ((UseDatabaseOperation) operation2).getCatalogName());
+		assertEquals("db1", ((UseDatabaseOperation) operation2).getDatabaseName());
+	}
+
+	@Test(expected = SqlConversionException.class)
+	public void testUseDatabaseWithException() {
+		final String sql = "USE cat1.db1.tbl1";
+		Operation operation = parse(sql, SqlDialect.DEFAULT);
+	}
+
+	@Test
+	public void testCreateDatabase() {
+		final String[] createDatabaseSqls = new String[] {
+				"create database db1",
+				"create database if not exists cat1.db1",
+				"create database cat1.db1 comment 'db1_comment'",
+				"create database cat1.db1 comment 'db1_comment' with ('k1' = 'v1', 'K2' = 'V2')"
+		};
+		final String[] expectedCatalogs = new String[] {"builtin", "cat1", "cat1", "cat1"};
+		final String expectedDatabase = "db1";
+		final String[] expectedComments = new String[] {null, null, "db1_comment", "db1_comment"};
+		final boolean[] expectedIgnoreIfExists = new boolean[] {false, true, false, false};
+		Map<String, String> properties = new HashMap<>();
+		properties.put("k1", "v1");
+		properties.put("K2", "V2");
+		final Map[] expectedProperties = new Map[] {
+				new HashMap<String, String>(),
+				new HashMap<String, String>(),
+				new HashMap<String, String>(),
+				new HashMap(properties)};
+
+		for (int i = 0; i < createDatabaseSqls.length; i++) {
+			Operation operation = parse(createDatabaseSqls[i], SqlDialect.DEFAULT);
+			assert operation instanceof CreateDatabaseOperation;
+			final CreateDatabaseOperation createDatabaseOperation = (CreateDatabaseOperation) operation;
+			assertEquals(expectedCatalogs[i], createDatabaseOperation.getCatalogName());
+			assertEquals(expectedDatabase, createDatabaseOperation.getDatabaseName());
+			assertEquals(expectedComments[i], createDatabaseOperation.getCatalogDatabase().getComment());
+			assertEquals(expectedIgnoreIfExists[i], createDatabaseOperation.isIgnoreIfExists());
+			assertEquals(expectedProperties[i], createDatabaseOperation.getCatalogDatabase().getProperties());
+		}
+	}
+
+	@Test
+	public void testDropDatabase() {
+		final String[] dropDatabaseSqls = new String[] {
+				"drop database db1",
+				"drop database if exists db1",
+				"drop database if exists cat1.db1 CASCADE",
+				"drop database if exists cat1.db1 RESTRICT"
+		};
+		final String[] expectedCatalogs = new String[] {"builtin", "builtin", "cat1", "cat1"};
+		final String expectedDatabase = "db1";
+		final boolean[] expectedIfExists = new boolean[] {false, true, true, true};
+		final boolean[] expectedIsCascades = new boolean[] {false, false, true, false};
+
+		for (int i = 0; i < dropDatabaseSqls.length; i++) {
+			Operation operation = parse(dropDatabaseSqls[i], SqlDialect.DEFAULT);
+			assert operation instanceof DropDatabaseOperation;
+			final DropDatabaseOperation dropDatabaseOperation = (DropDatabaseOperation) operation;
+			assertEquals(expectedCatalogs[i], dropDatabaseOperation.getCatalogName());
+			assertEquals(expectedDatabase, dropDatabaseOperation.getDatabaseName());
+			assertEquals(expectedIfExists[i], dropDatabaseOperation.isIfExists());
+			assertEquals(expectedIsCascades[i], dropDatabaseOperation.isCascade());
+		}
+	}
+
+	@Test
+	public void testAlterDatabase() throws Exception {
+		catalogManager.registerCatalog("cat1",
+									new GenericInMemoryCatalog("default", "default"));
+		catalogManager.getCatalog("cat1").get()
+						.createDatabase("db1",
+										new CatalogDatabaseImpl(new HashMap<>(), "db1_comment"),
+										true);
+		final String sql = "alter database cat1.db1 set ('k1'='v1', 'K2'='V2')";
+		Operation operation = parse(sql, SqlDialect.DEFAULT);
+		assert operation instanceof AlterDatabaseOperation;
+		Map<String, String> properties = new HashMap<>();
+		properties.put("k1", "v1");
+		properties.put("K2", "V2");
+		assertEquals("db1", ((AlterDatabaseOperation) operation).getDatabaseName());
+		assertEquals("cat1", ((AlterDatabaseOperation) operation).getCatalogName());
+		assertEquals("db1_comment", ((AlterDatabaseOperation) operation).getCatalogDatabase().getComment());
+		assertEquals(properties, ((AlterDatabaseOperation) operation).getCatalogDatabase().getProperties());
+	}
+
+	@Test
 	public void testCreateTable() {
 		final String sql = "CREATE TABLE tbl1 (\n" +
 			"  a bigint,\n" +
@@ -128,8 +244,8 @@ public class SqlToOperationConverterTest {
 			"    'connector' = 'kafka', \n" +
 			"    'kafka.topic' = 'log.test'\n" +
 			")\n";
-		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.DEFAULT);
-		final CalciteParser parser = getParserBySqlDialect(SqlDialect.DEFAULT);
+		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.HIVE);
+		final CalciteParser parser = getParserBySqlDialect(SqlDialect.HIVE);
 		Operation operation = parse(sql, planner, parser);
 		assert operation instanceof CreateTableOperation;
 		CreateTableOperation op = (CreateTableOperation) operation;
@@ -147,8 +263,8 @@ public class SqlToOperationConverterTest {
 
 	@Test(expected = SqlConversionException.class)
 	public void testCreateTableWithPkUniqueKeys() {
-		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.DEFAULT);
-		final CalciteParser parser = getParserBySqlDialect(SqlDialect.DEFAULT);
+		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.HIVE);
+		final CalciteParser parser = getParserBySqlDialect(SqlDialect.HIVE);
 		final String sql = "CREATE TABLE tbl1 (\n" +
 			"  a bigint,\n" +
 			"  b varchar, \n" +
@@ -172,7 +288,7 @@ public class SqlToOperationConverterTest {
 			"  b bigint,\n" +
 			"  c varchar\n" +
 			") with (\n" +
-			"  'a-b-c-d124' = 'ab',\n" +
+			"  'a-B-c-d124' = 'Ab',\n" +
 			"  'a.b-c-d.e-f.g' = 'ada',\n" +
 			"  'a.b-c-d.e-f1231.g' = 'ada',\n" +
 			"  'a.b-c-d.*' = 'adad')\n";
@@ -184,12 +300,10 @@ public class SqlToOperationConverterTest {
 		assert operation instanceof CreateTableOperation;
 		CreateTableOperation op = (CreateTableOperation) operation;
 		CatalogTable catalogTable = op.getCatalogTable();
-		Map<String, String> properties = catalogTable.toProperties()
-			.entrySet().stream()
-			.filter(e -> !e.getKey().contains("schema"))
-			.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+		Map<String, String> properties = catalogTable.getProperties()
+			.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 		Map<String, String> sortedProperties = new TreeMap<>(properties);
-		final String expected = "{a-b-c-d124=ab, "
+		final String expected = "{a-B-c-d124=Ab, "
 			+ "a.b-c-d.*=adad, "
 			+ "a.b-c-d.e-f.g=ada, "
 			+ "a.b-c-d.e-f1231.g=ada}";
@@ -199,8 +313,7 @@ public class SqlToOperationConverterTest {
 	@Test
 	public void testCreateTableWithWatermark() throws FunctionAlreadyExistException, DatabaseNotExistException {
 		CatalogFunction cf = new CatalogFunctionImpl(
-			JavaUserDefinedScalarFunctions.JavaFunc5.class.getName(),
-			Collections.emptyMap());
+			JavaUserDefinedScalarFunctions.JavaFunc5.class.getName());
 		catalog.createFunction(ObjectPath.fromString("default.myfunc"), cf, true);
 
 		final String sql = "create table source_table(\n" +
@@ -221,16 +334,16 @@ public class SqlToOperationConverterTest {
 		Map<String, String> properties = catalogTable.toProperties();
 		Map<String, String> expected = new HashMap<>();
 		expected.put("schema.0.name", "a");
-		expected.put("schema.0.type", "INT");
+		expected.put("schema.0.data-type", "INT");
 		expected.put("schema.1.name", "b");
-		expected.put("schema.1.type", "BIGINT");
+		expected.put("schema.1.data-type", "BIGINT");
 		expected.put("schema.2.name", "c");
-		expected.put("schema.2.type", "TIMESTAMP");
+		expected.put("schema.2.data-type", "TIMESTAMP(3)");
 		expected.put("schema.watermark.0.rowtime", "c");
 		expected.put(
 			"schema.watermark.0.strategy.expr",
 			"`builtin`.`default`.`myfunc`(`c`, 1) - INTERVAL '5' SECOND");
-		expected.put("schema.watermark.0.strategy.datatype", "TIMESTAMP(3)");
+		expected.put("schema.watermark.0.strategy.data-type", "TIMESTAMP(3)");
 		expected.put("connector.type", "kafka");
 		assertEquals(expected, properties);
 	}
@@ -238,8 +351,8 @@ public class SqlToOperationConverterTest {
 	@Test
 	public void testSqlInsertWithStaticPartition() {
 		final String sql = "insert into t1 partition(a=1) select b, c, d from t2";
-		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.HIVE);
-		final CalciteParser parser = getParserBySqlDialect(SqlDialect.HIVE);
+		FlinkPlannerImpl planner = getPlannerBySqlDialect(SqlDialect.DEFAULT);
+		final CalciteParser parser = getParserBySqlDialect(SqlDialect.DEFAULT);
 		Operation operation = parse(sql, planner, parser);
 		assert operation instanceof CatalogSinkModifyOperation;
 		CatalogSinkModifyOperation sinkModifyOperation = (CatalogSinkModifyOperation) operation;
@@ -288,12 +401,12 @@ public class SqlToOperationConverterTest {
 			createTestItem("TIME(3)", DataTypes.TIME()),
 			// Expect to be TIME(3).
 			createTestItem("TIME(3) WITHOUT TIME ZONE", DataTypes.TIME()),
-			createTestItem("TIMESTAMP", DataTypes.TIMESTAMP(3)),
-			createTestItem("TIMESTAMP WITHOUT TIME ZONE", DataTypes.TIMESTAMP(3)),
+			createTestItem("TIMESTAMP", DataTypes.TIMESTAMP(6)),
+			createTestItem("TIMESTAMP WITHOUT TIME ZONE", DataTypes.TIMESTAMP(6)),
 			createTestItem("TIMESTAMP(3)", DataTypes.TIMESTAMP(3)),
 			createTestItem("TIMESTAMP(3) WITHOUT TIME ZONE", DataTypes.TIMESTAMP(3)),
 			createTestItem("TIMESTAMP WITH LOCAL TIME ZONE",
-				DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3)),
+				DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(6)),
 			createTestItem("TIMESTAMP(3) WITH LOCAL TIME ZONE",
 				DataTypes.TIMESTAMP_WITH_LOCAL_TIME_ZONE(3)),
 			createTestItem("ARRAY<TIMESTAMP(3) WITH LOCAL TIME ZONE>",
@@ -444,6 +557,47 @@ public class SqlToOperationConverterTest {
 			columnExpressions);
 	}
 
+	@Test
+	public void testAlterTable() throws Exception {
+		Catalog catalog = new GenericInMemoryCatalog("default", "default");
+		catalogManager.registerCatalog("cat1", catalog);
+		catalog.createDatabase("db1", new CatalogDatabaseImpl(new HashMap<>(), null), true);
+		CatalogTable catalogTable = new CatalogTableImpl(
+				TableSchema.builder().field("a", DataTypes.STRING()).build(),
+				new HashMap<>(),
+				"tb1");
+		catalogManager.setCurrentCatalog("cat1");
+		catalogManager.setCurrentDatabase("db1");
+		catalog.createTable(new ObjectPath("db1", "tb1"), catalogTable, true);
+		final String[] renameTableSqls = new String[] {
+				"alter table cat1.db1.tb1 rename to tb2",
+				"alter table db1.tb1 rename to tb2",
+				"alter table tb1 rename to cat1.db1.tb2",
+		};
+		final ObjectIdentifier expectedIdentifier =
+				ObjectIdentifier.of("cat1", "db1", "tb1");
+		final ObjectIdentifier expectedNewIdentifier =
+				ObjectIdentifier.of("cat1", "db1", "tb2");
+		//test rename table converter
+		for (int i = 0; i < renameTableSqls.length; i++) {
+			Operation operation = parse(renameTableSqls[i], SqlDialect.DEFAULT);
+			assert operation instanceof AlterTableRenameOperation;
+			final AlterTableRenameOperation alterTableRenameOperation = (AlterTableRenameOperation) operation;
+			assertEquals(expectedIdentifier, alterTableRenameOperation.getTableIdentifier());
+			assertEquals(expectedNewIdentifier, alterTableRenameOperation.getNewTableIdentifier());
+		}
+		// test alter table properties
+		Operation operation = parse("alter table cat1.db1.tb1 set ('k1' = 'v1', 'K2' = 'V2')", SqlDialect.DEFAULT);
+		assert operation instanceof AlterTablePropertiesOperation;
+		final AlterTablePropertiesOperation alterTablePropertiesOperation = (AlterTablePropertiesOperation) operation;
+		assertEquals(expectedIdentifier, alterTablePropertiesOperation.getTableIdentifier());
+		assertEquals(2, alterTablePropertiesOperation.getCatalogTable().getProperties().size());
+		Map<String, String> properties = new HashMap<>();
+		properties.put("k1", "v1");
+		properties.put("K2", "V2");
+		assertEquals(properties, alterTablePropertiesOperation.getCatalogTable().getProperties());
+	}
+
 	//~ Tool Methods ----------------------------------------------------------
 
 	private static TestItem createTestItem(Object... args) {
@@ -459,6 +613,13 @@ public class SqlToOperationConverterTest {
 	}
 
 	private Operation parse(String sql, FlinkPlannerImpl planner, CalciteParser parser) {
+		SqlNode node = parser.parse(sql);
+		return SqlToOperationConverter.convert(planner, catalogManager, node).get();
+	}
+
+	private Operation parse(String sql, SqlDialect sqlDialect) {
+		FlinkPlannerImpl planner = getPlannerBySqlDialect(sqlDialect);
+		final CalciteParser parser = getParserBySqlDialect(sqlDialect);
 		SqlNode node = parser.parse(sql);
 		return SqlToOperationConverter.convert(planner, catalogManager, node).get();
 	}

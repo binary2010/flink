@@ -100,8 +100,9 @@ public class DependencyTest {
 			new DefaultClusterClientServiceLoader());
 
 		final SessionContext session = new SessionContext("test-session", new Environment());
+		String sessionId = executor.openSession(session);
 
-		final TableSchema result = executor.getTableSchema(session, "TableNumber1");
+		final TableSchema result = executor.getTableSchema(sessionId, "TableNumber1");
 		final TableSchema expected = TableSchema.builder()
 			.field("IntegerField1", Types.INT())
 			.field("StringField1", Types.STRING())
@@ -212,7 +213,7 @@ public class DependencyTest {
 	public static class TestHiveCatalogFactory extends HiveCatalogFactory {
 		public static final String ADDITIONAL_TEST_DATABASE = "additional_test_database";
 		public static final String TEST_TABLE = "test_table";
-		static final String TABLE_WITH_PARAMETERIZED_TYPES = "para_types_table";
+		static final String TABLE_WITH_PARAMETERIZED_TYPES = "param_types_table";
 
 		@Override
 		public Map<String, String> requiredContext() {
@@ -221,6 +222,14 @@ public class DependencyTest {
 			// For factory discovery service to distinguish TestHiveCatalogFactory from HiveCatalogFactory
 			context.put("test", "test");
 			return context;
+		}
+
+		@Override
+		public List<String> supportedProperties() {
+			List<String> list = super.supportedProperties();
+			list.add(CatalogConfig.IS_GENERIC);
+
+			return list;
 		}
 
 		@Override
@@ -248,7 +257,7 @@ public class DependencyTest {
 							.field("testcol", DataTypes.INT())
 							.build(),
 						new HashMap<String, String>() {{
-							put(CatalogConfig.IS_GENERIC, String.valueOf(true));
+							put(CatalogConfig.IS_GENERIC, String.valueOf(false));
 						}},
 						""
 					),
@@ -268,7 +277,12 @@ public class DependencyTest {
 		private CatalogTable tableWithParameterizedTypes() {
 			TableSchema tableSchema = TableSchema.builder().fields(new String[]{"dec", "ch", "vch"},
 					new DataType[]{DataTypes.DECIMAL(10, 10), DataTypes.CHAR(5), DataTypes.VARCHAR(15)}).build();
-			return new CatalogTableImpl(tableSchema, Collections.emptyMap(), "");
+			return new CatalogTableImpl(
+				tableSchema,
+				new HashMap<String, String>() {{
+					put(CatalogConfig.IS_GENERIC, String.valueOf(false));
+				}},
+				"");
 		}
 	}
 }

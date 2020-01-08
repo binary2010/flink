@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.catalog;
 
+import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.catalog.exceptions.DatabaseAlreadyExistException;
 import org.apache.flink.table.catalog.exceptions.DatabaseNotExistException;
 import org.apache.flink.table.catalog.exceptions.FunctionAlreadyExistException;
@@ -61,6 +62,7 @@ public class FunctionCatalogTest {
 		catalog = new GenericInMemoryCatalog(testCatalogName);
 		moduleManager = new ModuleManager();
 		functionCatalog = new FunctionCatalog(
+			TableConfig.getDefault(),
 			new CatalogManager(testCatalogName, catalog), moduleManager);
 	}
 
@@ -91,7 +93,7 @@ public class FunctionCatalogTest {
 		// test catalog function is found
 		catalog.createFunction(
 			oi.toObjectPath(),
-			new CatalogFunctionImpl(TestFunction1.class.getName(), Collections.emptyMap()), false);
+			new CatalogFunctionImpl(TestFunction1.class.getName()), false);
 
 		FunctionLookup.Result result = functionCatalog.lookupFunction(identifier).get();
 
@@ -125,7 +127,7 @@ public class FunctionCatalogTest {
 		// test catalog function is found
 		catalog.createFunction(
 			oi.toObjectPath(),
-			new CatalogFunctionImpl(TestFunction1.class.getName(), Collections.emptyMap()), false);
+			new CatalogFunctionImpl(TestFunction1.class.getName()), false);
 
 		FunctionLookup.Result result = functionCatalog.lookupFunction(UnresolvedIdentifier.of(TEST_FUNCTION_NAME)).get();
 

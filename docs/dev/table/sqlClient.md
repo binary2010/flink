@@ -1,7 +1,7 @@
 ---
 title: "SQL Client"
 nav-parent_id: tableapi
-nav-pos: 100
+nav-pos: 90
 is_beta: true
 ---
 <!--
@@ -318,25 +318,22 @@ tables:
       topic: TaxiRides
       startup-mode: earliest-offset
       properties:
-        - key: zookeeper.connect
-          value: localhost:2181
-        - key: bootstrap.servers
-          value: localhost:9092
-        - key: group.id
-          value: testGroup
+        zookeeper.connect: localhost:2181
+        bootstrap.servers: localhost:9092
+        group.id: testGroup
     format:
       property-version: 1
       type: json
       schema: "ROW<rideId LONG, lon FLOAT, lat FLOAT, rideTime TIMESTAMP>"
     schema:
       - name: rideId
-        type: LONG
+        data-type: BIGINT
       - name: lon
-        type: FLOAT
+        data-type: FLOAT
       - name: lat
-        type: FLOAT
+        data-type: FLOAT
       - name: rowTime
-        type: TIMESTAMP
+        data-type: TIMESTAMP(3)
         rowtime:
           timestamps:
             type: "from-field"
@@ -345,7 +342,7 @@ tables:
             type: "periodic-bounded"
             delay: "60000"
       - name: procTime
-        type: TIMESTAMP
+        data-type: TIMESTAMP(3)
         proctime: true
 {% endhighlight %}
 
@@ -372,12 +369,12 @@ functions:
   - name: ...               # required: name of the function
     from: class             # required: source of the function (can only be "class" for now)
     class: ...              # required: fully qualified class name of the function
-    constructor:            # optimal: constructor parameters of the function class
-      - ...                 # optimal: a literal parameter with implicit type
-      - class: ...          # optimal: full class name of the parameter
-        constructor:        # optimal: constructor parameters of the parameter's class
-          - type: ...       # optimal: type of the literal parameter
-            value: ...      # optimal: value of the literal parameter
+    constructor:            # optional: constructor parameters of the function class
+      - ...                 # optional: a literal parameter with implicit type
+      - class: ...          # optional: full class name of the parameter
+        constructor:        # optional: constructor parameters of the parameter's class
+          - type: ...       # optional: type of the literal parameter
+            value: ...      # optional: value of the literal parameter
 {% endhighlight %}
 
 Make sure that the order and types of the specified parameters strictly match one of the constructors of your function class.
@@ -488,25 +485,22 @@ tables:
       version: "0.11"
       topic: OutputTopic
       properties:
-        - key: zookeeper.connect
-          value: localhost:2181
-        - key: bootstrap.servers
-          value: localhost:9092
-        - key: group.id
-          value: testGroup
+        zookeeper.connect: localhost:2181
+        bootstrap.servers: localhost:9092
+        group.id: testGroup
     format:
       property-version: 1
       type: json
       derive-schema: true
     schema:
       - name: rideId
-        type: LONG
+        data-type: BIGINT
       - name: lon
-        type: FLOAT
+        data-type: FLOAT
       - name: lat
-        type: FLOAT
+        data-type: FLOAT
       - name: rideTime
-        type: TIMESTAMP
+        data-type: TIMESTAMP(3)
 {% endhighlight %}
 
 The SQL Client makes sure that a statement is successfully submitted to the cluster. Once the query is submitted, the CLI will show information about the Flink job.
@@ -582,11 +576,11 @@ tables:
     format: # ...
     schema:
       - name: integerField
-        type: INT
+        data-type: INT
       - name: stringField
-        type: VARCHAR
+        data-type: STRING
       - name: rowtimeField
-        type: TIMESTAMP
+        data-type: TIMESTAMP(3)
         rowtime:
           timestamps:
             type: from-field

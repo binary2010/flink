@@ -23,7 +23,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation
 import org.apache.flink.api.dag.Transformation
 import org.apache.flink.core.io.InputSplit
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
-import org.apache.flink.table.planner.plan.schema.{FlinkRelOptTable, TableSourceTable}
+import org.apache.flink.table.planner.plan.schema.TableSourceTable
 import org.apache.flink.table.runtime.types.TypeInfoDataTypeConverter.fromDataTypeToTypeInfo
 import org.apache.flink.table.sources.{InputFormatTableSource, StreamTableSource, TableSource}
 
@@ -40,7 +40,7 @@ import scala.collection.JavaConverters._
 abstract class PhysicalTableSourceScan(
     cluster: RelOptCluster,
     traitSet: RelTraitSet,
-    relOptTable: FlinkRelOptTable)
+    relOptTable: TableSourceTable[_])
   extends TableScan(cluster, traitSet, relOptTable) {
 
   // cache table source transformation.
@@ -58,13 +58,8 @@ abstract class PhysicalTableSourceScan(
   }
 
   override def explainTerms(pw: RelWriter): RelWriter = {
-    val hasWatermark = tableSourceTable.watermarkSpec.isDefined && tableSourceTable.isStreamingMode
-    val rowtime = tableSourceTable.watermarkSpec.map(_.getRowtimeAttribute).orNull
-    val watermark = tableSourceTable.watermarkSpec.map(_.getWatermarkExpressionString).orNull
     super.explainTerms(pw)
       .item("fields", getRowType.getFieldNames.asScala.mkString(", "))
-      .itemIf("rowtime", rowtime, hasWatermark)
-      .itemIf("watermark", watermark, hasWatermark)
   }
 
   def createInput[IN](
